@@ -2,7 +2,7 @@
 #define TIMER_H
 
 
-#include <cuda.h>
+#include "cuda.h"
 #include "CU.h"
 #include <chrono>
 #include <iostream>
@@ -39,21 +39,6 @@ class Timer
   
   void printElapsed(const char *msg)
     {
-      if (device == GPU) {
-	cudaEvent_t final_event;
-	CU(cudaEventCreate(&final_event));
-	CU(cudaEventRecord(final_event, 0));
-	
-	cudaError_t status = cudaEventQuery(final_event);
-	switch (status) {
-	case cudaSuccess: break; // OK to get timing
-        case cudaErrorNotReady:
-	  cout << "printElapsed called before GPU finished.\nPlease use cudaDeviceSynchronize() first" << endl;
-	  return;
-	default: CU(cudaEventQuery(final_event)); return;  // just generate the error message
-	}
-      }
-      
       auto end = chrono::high_resolution_clock::now();
       auto elapsed = chrono::duration_cast<chrono::milliseconds>(end - start);
       

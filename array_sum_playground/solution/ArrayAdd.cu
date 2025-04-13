@@ -194,7 +194,8 @@ int main(int argc, char *argv[])
   ELEMENT *dA;
   CU(cudaMalloc((void**)&dA, n*sizeof(ELEMENT)));
   CU(cudaMemcpy(dA, hA, n*sizeof(ELEMENT), cudaMemcpyHostToDevice));  
-  
+
+  CU(cudaDeviceSynchronize());
   gpuTimer.printElapsed("to allocate and transfer array");
 
   
@@ -220,10 +221,11 @@ int main(int argc, char *argv[])
 
   // Each iteration reduces the problem by a factor of numElementsPerBlock
   for(;;) {
-    addKernel<<<outNum, numElementsPerBlock/2>>>(inNum, inA, outNum, outA);
+    addKernel<<<outNum, numElementsPerBlock/2, numElementsPerBlock*sizeof(ELEMENT)>>>(inNum, inA, outNum, outA);
 
     // If this is the last iteration then extract the final result from outA
     if (outNum == 1) { 
+      CU(cudaDeviceSynchronize());	
       CU(cudaMemcpy(&dSum, outA, sizeof(ELEMENT), cudaMemcpyDeviceToHost)); 
       break;
     }
@@ -237,6 +239,7 @@ int main(int argc, char *argv[])
     outA = temp;
   }
   
+  CU(cudaDeviceSynchronize());
   gpuTimer.printElapsed("to add all elements");
 
 
