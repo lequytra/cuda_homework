@@ -35,7 +35,7 @@ __global__ void minmax(ELEMENT* input, ELEMENT* minOutput, ELEMENT* maxOutput, I
     extern __shared__ ELEMENT maxIntermediate[]; 
     if (startIdx < size) {
         minIntermediate[t] = input[startIdx];
-        maxIntermediate[t] = minIntermediate[t];
+        maxIntermediate[t] = input[startIdx];
     }
     else {
         minIntermediate[t] = ELEMENT_MAX; 
@@ -43,13 +43,23 @@ __global__ void minmax(ELEMENT* input, ELEMENT* minOutput, ELEMENT* maxOutput, I
     }
     if (startIdx + halfSize < size) {
         minIntermediate[t + halfSize] = input[startIdx + halfSize];
-        maxIntermediate[t + halfSize] = minIntermediate[startIdx + halfSize];
+        maxIntermediate[t + halfSize] = input[startIdx + halfSize];
     }
     else {
         minIntermediate[t] = ELEMENT_MAX; 
         maxIntermediate[t] = ELEMENT_MIN; 
     }
-
+    minIntermediate[5] = ELEMENT_MAX;
+    maxIntermediate[5] = ELEMENT_MIN;
+    // __syncthreads(); 
+    // if (threadIdx.x == 0) {
+    //     printf("Block %d intermediates: ", blockIdx.x);
+    //     for (int i = 0; i < blockDim.x; i++) {
+    //         printf("[%u,%u] ", minIntermediate[i], maxIntermediate[i]);
+    //     }
+    //     printf("\n");
+    // }
+    
     t <<= 1; 
     for (INDEX stride = 1; stride < halfSize; stride <<= 1) {
         __syncthreads(); 
@@ -61,10 +71,14 @@ __global__ void minmax(ELEMENT* input, ELEMENT* minOutput, ELEMENT* maxOutput, I
 
     __syncthreads(); // Q: Do we need __synthreads here?
     if (threadIdx.x == 0) {
+        // printf("Block %d intermediates: ", blockIdx.x);
+        // for (int i = 0; i < blockDim.x; i++) {
+        //     printf("[%u,%u] ", minIntermediate[i], maxIntermediate[i]);
+        // }
+        // printf("\n");
         minOutput[blockIdx.x] = minIntermediate[0];
         maxOutput[blockIdx.x] = maxIntermediate[0];
     }
-
 }
 
 void printUsage(const char* program_name) {
@@ -196,12 +210,12 @@ int main(int argc, char** argv) {
     if (use_random) {
         printf("Using random input values\n");
         for (int i = 0; i < size; i++) {
-            hInput[i] = rand() % num_bins;  // Values between 0 and num_bins-1
+            hInput[i] = rand();  // Values between 0 and num_bins-1
         }
     } else {
         printf("Using incrementing input values\n");
         for (int i = 0; i < size; i++) {
-            hInput[i] = i % num_bins;  // Values cycle from 0 to num_bins-1
+            hInput[i] = i;  // Values cycle from 0 to num_bins-1
         }
     }
     // pad zero
