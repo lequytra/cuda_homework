@@ -1,23 +1,37 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <tuple>
 #include <cuda_runtime.h>
 #include <string.h>
+#include "../CU.h"
 
-// Error checking macro
-#define CHECK(call) \
-{ \
-    const cudaError_t error = call; \
-    if (error != cudaSuccess) \
-    { \
-        printf("Error: %s:%d, ", __FILE__, __LINE__); \
-        printf("code:%d, reason: %s\n", error, cudaGetErrorString(error)); \
-        exit(1); \
-    } \
-}
+typedef unsigned int    ELEMENT;
+typedef long            INDEX; 
 
-// Kernel function declaration
-__global__ void histogram_kernel(const unsigned int* input, unsigned int* output, int size) {
-    // TODO: Implement histogram kernel
+template <typename Op>
+__global__ void reduce(ELEMENT* input, ELEMENT* output, Op op) {
+    INDEX startIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    INDEX t = threadIdx.x; 
+    INDEX halfSize = blockDim.x / 2; 
+
+    // copy data to shared memory, each thread handles 2
+    extern __shared__ ELEMENT intermediate[]; 
+    intermediate[t] = input[startIdx];
+    intermediate[t + halfSize] = input[startIdx + halfSize];
+
+    t <<= 1; 
+    for (INDEX stride = 1; stride < halfSize; stride <<= 1) {
+        __syncthreads(); 
+        if (t % stride == 0) {
+            intermediate[t] = op(intermediate[t], intermediate[t + stride]);
+        }
+    }
+
+    __syncthreads(); // Q: Do we need __synthreads here?
+    if (threadIdx.x == 0) {
+        output[blockIdx.x] = intermediate[0];
+    }
+
 }
 
 void print_usage(const char* program_name) {
@@ -126,28 +140,28 @@ int main(int argc, char** argv) {
     // Device memory allocation
     unsigned int* d_input;
     unsigned int* d_output;
-    CHECK(cudaMalloc((void**)&d_input, size * sizeof(unsigned int)));
-    CHECK(cudaMalloc((void**)&d_output, num_bins * sizeof(unsigned int)));
+    CU(cudaMalloc((void**)&d_input, size * sizeof(unsigned int)));
+    CU(cudaMalloc((void**)&d_output, num_bins * sizeof(unsigned int)));
     
     // Copy input data to device
-    CHECK(cudaMemcpy(d_input, h_input, size * sizeof(unsigned int), cudaMemcpyHostToDevice));
+    CU(cudaMemcpy(d_input, h_input, size * sizeof(unsigned int), cudaMemcpyHostToDevice));
     
     // Initialize output array to zero
-    CHECK(cudaMemset(d_output, 0, num_bins * sizeof(unsigned int)));
+    CU(cudaMemset(d_output, 0, num_bins * sizeof(unsigned int)));
     
     // Launch kernel
     // TODO: Configure grid and block dimensions
     // histogram_kernel<<<grid, block>>>(d_input, d_output, size);
     
     // Copy result back to host
-    CHECK(cudaMemcpy(h_output, d_output, num_bins * sizeof(unsigned int), cudaMemcpyDeviceToHost));
+    CU(cudaMemcpy(h_output, d_output, num_bins * sizeof(unsigned int), cudaMemcpyDeviceToHost));
     
     // Print output array (should be all zeros since kernel is not implemented)
     print_array("Output array", h_output, num_bins);
     
     // Free device memory
-    CHECK(cudaFree(d_input));
-    CHECK(cudaFree(d_output));
+    CU(cudaFree(d_input));
+    CU(cudaFree(d_output));
     
     // Free host memory
     free(h_input);
