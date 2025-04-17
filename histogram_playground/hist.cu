@@ -49,8 +49,7 @@ __global__ void minmax(ELEMENT* input, ELEMENT* minOutput, ELEMENT* maxOutput, I
         minIntermediate[t] = ELEMENT_MAX; 
         maxIntermediate[t] = ELEMENT_MIN; 
     }
-    minIntermediate[5] = ELEMENT_MAX;
-    maxIntermediate[5] = ELEMENT_MIN;
+
     // __syncthreads(); 
     // if (threadIdx.x == 0) {
     //     printf("Block %d intermediates: ", blockIdx.x);
