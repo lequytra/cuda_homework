@@ -25,7 +25,6 @@ typedef long            INDEX;
 const ELEMENT ELEMENT_MAX = UINT_MAX;
 const ELEMENT ELEMENT_MIN = 0;
 
-template <typename Op>
 __global__ void minmax(ELEMENT* input, ELEMENT* minOutput, ELEMENT* maxOutput, INDEX size) {
     INDEX startIdx = blockIdx.x * blockDim.x + threadIdx.x;
     INDEX t = threadIdx.x; 
@@ -146,12 +145,12 @@ INDEX getMaxElements() {
 
     INDEX numElements = min(
         // we initialize 2 arrays in shared memory
-        p.sharedMemPerBlock / (2 * sizeof(ELEMENT)), 
-        min(
+        (int)(p.sharedMemPerBlock / (2 * sizeof(ELEMENT))), 
+        2 * min(
             p.maxThreadsPerBlock,
-            2 * p.maxThreadsDim[0], // 1 thread handles 2 elments
+            p.maxThreadsDim[0] // 1 thread handles 2 elments
         )
-    )
+    );
     return powerOf2(numElements); 
 }
 
@@ -234,9 +233,11 @@ int main(int argc, char** argv) {
     // Launch kernel
     for (;;) {
         numBlocks = ceil(numElements / maxElements);
-        numThreads = min(numElements, maxElements); 
 
-        minmax<<<numBlocks, numThreads>>>(dInput, dOutputMin, dOutputMax, curSize); 
+        numThreads = maxElements / 2; 
+        printf("  Blocks: %d, Threads: %d\n", numBlocks, numThreads);
+
+        minmax<<<numBlocks, numThreads, maxElements * 2 * sizeof(ELEMENT)>>>(dInput, dOutputMin, dOutputMax, curSize); 
 
         numElements = numBlocks; 
         curSize = numElements; 
