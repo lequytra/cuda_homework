@@ -1,7 +1,7 @@
 
 #include <iostream>
 #include "cuda.h"
-#include "CU.h"
+#include "../../CU.h"
 #include "Timer.h"
 
 using namespace std;

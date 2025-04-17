@@ -1,5 +1,5 @@
 #include <iostream>
-#include "solution/CU.h"
+#include "../CU.h"
 
 using namespace std;
 
@@ -82,7 +82,7 @@ int main(int argc, char *argv[]) {
     // srand(1);
     for (INDEX i = 0; i < n; i++) {
         // hA[i] = rand();
-        hA[i] = i;
+        hA[i] = 1;
     }
     for (INDEX i = n; i < N; i++) {
         hA[i] = 0; 
