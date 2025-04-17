@@ -1,4 +1,17 @@
+/*
+ * Compile: nvcc hist.cu -o hist
+ * Run: ./hist [options]
+ * Options:
+ *   --random       : Use random input values (default)
+ *   --incrementing : Use incrementing input values
+ *   --size N       : Set input array size (default: 1024)
+ *   --bins N       : Set number of histogram bins (default: 256)
+ * 
+ * Example: ./hist --incrementing --size 2048 --bins 128
+ */
+
 #include <stdio.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <tuple>
 #include <cuda_runtime.h>
@@ -8,33 +21,54 @@
 typedef unsigned int    ELEMENT;
 typedef long            INDEX; 
 
+// Constants for ELEMENT type bounds
+const ELEMENT ELEMENT_MAX = UINT_MAX;
+const ELEMENT ELEMENT_MIN = 0;
+
 template <typename Op>
-__global__ void reduce(ELEMENT* input, ELEMENT* output, Op op) {
+__global__ void minmax(ELEMENT* input, ELEMENT* minOutput, ELEMENT* maxOutput, INDEX size) {
     INDEX startIdx = blockIdx.x * blockDim.x + threadIdx.x;
     INDEX t = threadIdx.x; 
     INDEX halfSize = blockDim.x / 2; 
 
     // copy data to shared memory, each thread handles 2
-    extern __shared__ ELEMENT intermediate[]; 
-    intermediate[t] = input[startIdx];
-    intermediate[t + halfSize] = input[startIdx + halfSize];
+    extern __shared__ ELEMENT minIntermediate[]; 
+    extern __shared__ ELEMENT maxIntermediate[]; 
+    if (startIdx < size) {
+        minIntermediate[t] = input[startIdx];
+        maxIntermediate[t] = minIntermediate[t];
+    }
+    else {
+        minIntermediate[t] = ELEMENT_MAX; 
+        maxIntermediate[t] = ELEMENT_MIN; 
+    }
+    if (startIdx + halfSize < size) {
+        minIntermediate[t + halfSize] = input[startIdx + halfSize];
+        maxIntermediate[t + halfSize] = minIntermediate[startIdx + halfSize];
+    }
+    else {
+        minIntermediate[t] = ELEMENT_MAX; 
+        maxIntermediate[t] = ELEMENT_MIN; 
+    }
 
     t <<= 1; 
     for (INDEX stride = 1; stride < halfSize; stride <<= 1) {
         __syncthreads(); 
         if (t % stride == 0) {
-            intermediate[t] = op(intermediate[t], intermediate[t + stride]);
+            minIntermediate[t] = min(minIntermediate[t], minIntermediate[t + stride]);
+            maxIntermediate[t] = max(maxIntermediate[t], maxIntermediate[t + stride]);
         }
     }
 
     __syncthreads(); // Q: Do we need __synthreads here?
     if (threadIdx.x == 0) {
-        output[blockIdx.x] = intermediate[0];
+        minOutput[blockIdx.x] = minIntermediate[0];
+        maxOutput[blockIdx.x] = maxIntermediate[0];
     }
 
 }
 
-void print_usage(const char* program_name) {
+void printUsage(const char* program_name) {
     printf("Usage: %s [options]\n", program_name);
     printf("Options:\n");
     printf("  --random       : Use random input values (default)\n");
@@ -44,7 +78,7 @@ void print_usage(const char* program_name) {
     printf("\nExample: %s --incrementing --size 2048 --bins 128\n", program_name);
 }
 
-int parse_arguments(int argc, char** argv, bool* use_random, int* size, int* num_bins) {
+int parseArguments(int argc, char** argv, bool* use_random, INDEX* size, INDEX* num_bins) {
     // Default parameters
     *use_random = true;
     *size = 1024;
@@ -86,7 +120,7 @@ int parse_arguments(int argc, char** argv, bool* use_random, int* size, int* num
     return 0;
 }
 
-void print_array(const char* name, const unsigned int* array, int size, int max_print = 10) {
+void printArray(const char* name, const ELEMENT* array, INDEX size, INDEX max_print = 10) {
     printf("%s: [", name);
     for (int i = 0; i < size && i < max_print; i++) {
         printf("%u", array[i]);
@@ -100,72 +134,141 @@ void print_array(const char* name, const unsigned int* array, int size, int max_
     printf("]\n");
 }
 
+INDEX powerOf2(INDEX n) {
+    INDEX N; 
+    for (N = 1; N < n; N <<= 1) {}
+    return N; 
+}
+
+INDEX getMaxElements() {
+    cudaDeviceProp p; 
+    cudaGetDeviceProperties(&p, 0); 
+
+    INDEX numElements = min(
+        // we initialize 2 arrays in shared memory
+        p.sharedMemPerBlock / (2 * sizeof(ELEMENT)), 
+        min(
+            p.maxThreadsPerBlock,
+            2 * p.maxThreadsDim[0], // 1 thread handles 2 elments
+        )
+    )
+    return powerOf2(numElements); 
+}
+
+void verifyMinMaxResults(ELEMENT gpuMin, ELEMENT gpuMax, ELEMENT cpuMin, ELEMENT cpuMax) {
+    printf("\nVerifying results:\n");
+    printf("GPU Min: %u, Max: %u\n", gpuMin, gpuMax);
+    printf("CPU Min: %u, Max: %u\n", cpuMin, cpuMax);
+    
+    if (gpuMin == cpuMin && gpuMax == cpuMax) {
+        printf("Results match! Verification successful.\n");
+    } else {
+        printf("ERROR: Results do not match!\n");
+        if (gpuMin != cpuMin) printf("Min values differ - GPU: %u, CPU: %u\n", gpuMin, cpuMin);
+        if (gpuMax != cpuMax) printf("Max values differ - GPU: %u, CPU: %u\n", gpuMax, cpuMax);
+    }
+}
+
 int main(int argc, char** argv) {
-    // Parameters to be set by parse_arguments
+    // Parameters to be set by parseArguments
     bool use_random;
-    int size;
-    int num_bins;
+    INDEX size;
+    INDEX num_bins;
     
     // Parse command line arguments
-    if (parse_arguments(argc, argv, &use_random, &size, &num_bins) != 0) {
-        print_usage(argv[0]);
+    if (parseArguments(argc, argv, &use_random, &size, &num_bins) != 0) {
+        printUsage(argv[0]);
         return 1;
     }
+
+    INDEX sizePadded = powerOf2(size); 
     
     printf("Running with parameters:\n");
     printf("  Input type: %s\n", use_random ? "random" : "incrementing");
-    printf("  Array size: %d\n", size);
-    printf("  Number of bins: %d\n", num_bins);
+    printf("  Array size: %ld, padded: %ld\n", size, sizePadded);
+    printf("  Number of bins: %ld\n", num_bins);
     
     // Host memory allocation
-    unsigned int* h_input = (unsigned int*)malloc(size * sizeof(unsigned int));
-    unsigned int* h_output = (unsigned int*)malloc(num_bins * sizeof(unsigned int));
+    ELEMENT* hInput = (ELEMENT*)malloc(size * sizeof(ELEMENT));
+    ELEMENT* h_output = (ELEMENT*)malloc(num_bins * sizeof(ELEMENT));
+
     
     // Initialize input array
     if (use_random) {
         printf("Using random input values\n");
         for (int i = 0; i < size; i++) {
-            h_input[i] = rand() % num_bins;  // Values between 0 and num_bins-1
+            hInput[i] = rand() % num_bins;  // Values between 0 and num_bins-1
         }
     } else {
         printf("Using incrementing input values\n");
         for (int i = 0; i < size; i++) {
-            h_input[i] = i % num_bins;  // Values cycle from 0 to num_bins-1
+            hInput[i] = i % num_bins;  // Values cycle from 0 to num_bins-1
         }
+    }
+    // pad zero
+    for (INDEX i = size; i < sizePadded; i++) {
+        hInput[i] = 0; 
     }
     
     // Print first few elements of input array
-    print_array("Input array", h_input, size);
+    printArray("Input array", hInput, size);
     
     // Device memory allocation
-    unsigned int* d_input;
-    unsigned int* d_output;
-    CU(cudaMalloc((void**)&d_input, size * sizeof(unsigned int)));
-    CU(cudaMalloc((void**)&d_output, num_bins * sizeof(unsigned int)));
-    
+    ELEMENT* dInput;
+    CU(cudaMalloc((void**)&dInput, size * sizeof(ELEMENT)));
     // Copy input data to device
-    CU(cudaMemcpy(d_input, h_input, size * sizeof(unsigned int), cudaMemcpyHostToDevice));
+    CU(cudaMemcpy(dInput, hInput, size * sizeof(ELEMENT), cudaMemcpyHostToDevice));
     
-    // Initialize output array to zero
-    CU(cudaMemset(d_output, 0, num_bins * sizeof(unsigned int)));
+    INDEX maxElements = min(getMaxElements(), sizePadded);
+    INDEX numElements = sizePadded; 
+    int numBlocks = ceil(numElements / maxElements); 
+    int numThreads = min(numElements, maxElements); 
+
+    ELEMENT* dOutputMin;
+    ELEMENT* dOutputMax;
     
+    CU(cudaMalloc((void**)&dOutputMin, numBlocks * sizeof(ELEMENT)));
+    CU(cudaMalloc((void**)&dOutputMax, numBlocks * sizeof(ELEMENT)));
+    INDEX curSize = size; 
+    ELEMENT hMin, hMax;
     // Launch kernel
-    // TODO: Configure grid and block dimensions
-    // histogram_kernel<<<grid, block>>>(d_input, d_output, size);
+    for (;;) {
+        numBlocks = ceil(numElements / maxElements);
+        numThreads = min(numElements, maxElements); 
+
+        minmax<<<numBlocks, numThreads>>>(dInput, dOutputMin, dOutputMax, curSize); 
+
+        numElements = numBlocks; 
+        curSize = numElements; 
+
+        if (numElements == 1) {
+            CU(cudaDeviceSynchronize());
+            CU(cudaMemcpy(&hMin, dOutputMin, sizeof(ELEMENT), cudaMemcpyDeviceToHost));
+            CU(cudaMemcpy(&hMax, dOutputMax, sizeof(ELEMENT), cudaMemcpyDeviceToHost));
+            break;
+        }
+    }
     
-    // Copy result back to host
-    CU(cudaMemcpy(h_output, d_output, num_bins * sizeof(unsigned int), cudaMemcpyDeviceToHost));
+    // CPU verification
+    ELEMENT cpuMin = ELEMENT_MAX;
+    ELEMENT cpuMax = ELEMENT_MIN;
     
-    // Print output array (should be all zeros since kernel is not implemented)
-    print_array("Output array", h_output, num_bins);
+    // Simple sequential min/max calculation for verification
+    for (INDEX i = 0; i < size; i++) {
+        cpuMin = min(cpuMin, hInput[i]);
+        cpuMax = max(cpuMax, hInput[i]);
+    }
+    
+    // Compare GPU and CPU results
+    verifyMinMaxResults(hMin, hMax, cpuMin, cpuMax);
     
     // Free device memory
-    CU(cudaFree(d_input));
-    CU(cudaFree(d_output));
+    CU(cudaFree(dInput));
+    CU(cudaFree(dOutputMin));
+    CU(cudaFree(dOutputMax));
     
     // Free host memory
-    free(h_input);
-    free(h_output);
+    free(hInput);
     
     printf("Program completed successfully!\n");
     return 0;
