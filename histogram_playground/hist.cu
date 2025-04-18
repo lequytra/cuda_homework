@@ -55,6 +55,19 @@ __global__ void minmax(ELEMENT* input, ELEMENT* output, INDEX size) {
     }
 }
 
+__global__ void hist(ELEMENT* input, ELEMENT* output, ELEMENT stepSize, ELEMENT numBins) {
+    extern __shared__ ELEMENT copyA[];
+
+    INDEX startIdx = blockDim.x * blockIdx.x + threadIdx.x;
+    int t = threadIdx.x;
+
+    ELEMENT* input = &copyA[0];
+    ELEMENT* output = &copyA[blockDim.x];
+
+    
+
+}
+
 void printUsage(const char* program_name) {
     printf("Usage: %s [options]\n", program_name);
     printf("Options:\n");
