@@ -25,42 +25,22 @@ typedef long            INDEX;
 const ELEMENT ELEMENT_MAX = UINT_MAX;
 const ELEMENT ELEMENT_MIN = 0;
 
-__global__ void minmax(ELEMENT* input, ELEMENT* minOutput, ELEMENT* maxOutput, INDEX size) {
-    INDEX startIdx = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void minmax(ELEMENT* input, ELEMENT* output, INDEX size) {
+    INDEX startIdx = blockIdx.x * blockDim.x * 2 + threadIdx.x;
     INDEX t = threadIdx.x; 
-    INDEX halfSize = blockDim.x / 2; 
+    INDEX halfSize = blockDim.x; 
 
     // copy data to shared memory, each thread handles 2
-    extern __shared__ ELEMENT minIntermediate[]; 
-    extern __shared__ ELEMENT maxIntermediate[]; 
-    if (startIdx < size) {
-        minIntermediate[t] = input[startIdx];
-        maxIntermediate[t] = input[startIdx];
-    }
-    else {
-        minIntermediate[t] = ELEMENT_MAX; 
-        maxIntermediate[t] = ELEMENT_MIN; 
-    }
-    if (startIdx + halfSize < size) {
-        minIntermediate[t + halfSize] = input[startIdx + halfSize];
-        maxIntermediate[t + halfSize] = input[startIdx + halfSize];
-    }
-    else {
-        minIntermediate[t] = ELEMENT_MAX; 
-        maxIntermediate[t] = ELEMENT_MIN; 
-    }
+    extern __shared__ ELEMENT mem[]; 
+    ELEMENT* minIntermediate = &mem[0];
+    ELEMENT* maxIntermediate = &mem[halfSize * 2];
+    minIntermediate[t] = input[startIdx];
+    maxIntermediate[t] = input[startIdx];
+    minIntermediate[t + halfSize] = input[startIdx + halfSize];
+    maxIntermediate[t + halfSize] = input[startIdx + halfSize];
 
-    // __syncthreads(); 
-    // if (threadIdx.x == 0) {
-    //     printf("Block %d intermediates: ", blockIdx.x);
-    //     for (int i = 0; i < blockDim.x; i++) {
-    //         printf("[%u,%u] ", minIntermediate[i], maxIntermediate[i]);
-    //     }
-    //     printf("\n");
-    // }
-    
     t <<= 1; 
-    for (INDEX stride = 1; stride < halfSize; stride <<= 1) {
+    for (INDEX stride = 1; stride <= halfSize; stride <<= 1) {
         __syncthreads(); 
         if (t % stride == 0) {
             minIntermediate[t] = min(minIntermediate[t], minIntermediate[t + stride]);
@@ -70,13 +50,8 @@ __global__ void minmax(ELEMENT* input, ELEMENT* minOutput, ELEMENT* maxOutput, I
 
     __syncthreads(); // Q: Do we need __synthreads here?
     if (threadIdx.x == 0) {
-        // printf("Block %d intermediates: ", blockIdx.x);
-        // for (int i = 0; i < blockDim.x; i++) {
-        //     printf("[%u,%u] ", minIntermediate[i], maxIntermediate[i]);
-        // }
-        // printf("\n");
-        minOutput[blockIdx.x] = minIntermediate[0];
-        maxOutput[blockIdx.x] = maxIntermediate[0];
+        output[blockIdx.x] = minIntermediate[0];
+        output[blockIdx.x + gridDim.x] = maxIntermediate[0];
     }
 }
 
@@ -201,9 +176,7 @@ int main(int argc, char** argv) {
     printf("  Number of bins: %ld\n", num_bins);
     
     // Host memory allocation
-    ELEMENT* hInput = (ELEMENT*)malloc(size * sizeof(ELEMENT));
-    ELEMENT* h_output = (ELEMENT*)malloc(num_bins * sizeof(ELEMENT));
-
+    ELEMENT* hInput = (ELEMENT*)malloc(sizePadded * sizeof(ELEMENT));
     
     // Initialize input array
     if (use_random) {
@@ -217,50 +190,53 @@ int main(int argc, char** argv) {
             hInput[i] = i;  // Values cycle from 0 to num_bins-1
         }
     }
-    // pad zero
+    // pad with the last elements
     for (INDEX i = size; i < sizePadded; i++) {
-        hInput[i] = 0; 
+        hInput[i] = hInput[i -  1]; 
     }
     
     // Print first few elements of input array
     printArray("Input array", hInput, size);
-    
-    // Device memory allocation
-    ELEMENT* dInput;
-    CU(cudaMalloc((void**)&dInput, size * sizeof(ELEMENT)));
-    // Copy input data to device
-    CU(cudaMemcpy(dInput, hInput, size * sizeof(ELEMENT), cudaMemcpyHostToDevice));
     
     INDEX maxElements = min(getMaxElements(), sizePadded);
     INDEX numElements = sizePadded; 
     int numBlocks = ceil(numElements / maxElements); 
     int numThreads = min(numElements, maxElements); 
 
-    ELEMENT* dOutputMin;
-    ELEMENT* dOutputMax;
+    // Device memory allocation
+    ELEMENT* dInput;
+    CU(cudaMalloc((void**)&dInput, sizePadded * sizeof(ELEMENT)));
+    // Copy input data to device
+    CU(cudaMemcpy(dInput, hInput, sizePadded * sizeof(ELEMENT), cudaMemcpyHostToDevice));
     
-    CU(cudaMalloc((void**)&dOutputMin, numBlocks * sizeof(ELEMENT)));
-    CU(cudaMalloc((void**)&dOutputMax, numBlocks * sizeof(ELEMENT)));
+
+    ELEMENT* dOutput;
+    
+    CU(cudaMalloc((void**)&dOutput, numBlocks * 2 * sizeof(ELEMENT)));
     INDEX curSize = size; 
-    ELEMENT hMin, hMax;
+    ELEMENT hOut[2];
     // Launch kernel
     for (;;) {
-        numBlocks = ceil(numElements / maxElements);
-
-        numThreads = maxElements / 2; 
+        numBlocks = ceil((float)numElements / maxElements);
+        INDEX curNumElements = min(numElements, maxElements);
+        numThreads = curNumElements / 2; 
         printf("  Blocks: %d, Threads: %d\n", numBlocks, numThreads);
+        // TODO: Need to properly swapped out input and output here per iteration
+        minmax<<<numBlocks, numThreads, curNumElements * 2 * sizeof(ELEMENT)>>>(dInput, dOutput, curSize); 
 
-        minmax<<<numBlocks, numThreads, maxElements * 2 * sizeof(ELEMENT)>>>(dInput, dOutputMin, dOutputMax, curSize); 
-
-        numElements = numBlocks; 
+        numElements = numBlocks * 2; 
         curSize = numElements; 
 
-        if (numElements == 1) {
+        if (numBlocks <= 1) {
             CU(cudaDeviceSynchronize());
-            CU(cudaMemcpy(&hMin, dOutputMin, sizeof(ELEMENT), cudaMemcpyDeviceToHost));
-            CU(cudaMemcpy(&hMax, dOutputMax, sizeof(ELEMENT), cudaMemcpyDeviceToHost));
+            CU(cudaMemcpy(&hOut, dOutput, 2 * sizeof(ELEMENT), cudaMemcpyDeviceToHost));
             break;
         }
+
+        ELEMENT* temp; 
+        temp = dInput; 
+        dInput = dOutput; 
+        dOutput = temp; 
     }
     
     // CPU verification
@@ -274,15 +250,14 @@ int main(int argc, char** argv) {
     }
     
     // Compare GPU and CPU results
-    verifyMinMaxResults(hMin, hMax, cpuMin, cpuMax);
-    
-    // Free device memory
-    CU(cudaFree(dInput));
-    CU(cudaFree(dOutputMin));
-    CU(cudaFree(dOutputMax));
-    
+    verifyMinMaxResults(hOut[0], hOut[1], cpuMin, cpuMax);
+
     // Free host memory
     free(hInput);
+    
+    // // Free device memory
+    CU(cudaFree(dInput));
+    CU(cudaFree(dOutput));
     
     printf("Program completed successfully!\n");
     return 0;
