@@ -18,6 +18,11 @@
 #include <string.h>
 #include "../CU.h"
 
+// ANSI color codes
+#define ANSI_COLOR_RED     "\x1b[31m"
+#define ANSI_COLOR_GREEN   "\x1b[32m"
+#define ANSI_COLOR_RESET   "\x1b[0m"
+
 typedef unsigned int    ELEMENT;
 typedef long            INDEX; 
 
@@ -55,16 +60,41 @@ __global__ void minmax(ELEMENT* input, ELEMENT* output, INDEX size) {
     }
 }
 
-__global__ void hist(ELEMENT* input, ELEMENT* output, ELEMENT stepSize, ELEMENT numBins) {
-    extern __shared__ ELEMENT copyA[];
-
+__global__ void hist(
+    ELEMENT* input,
+    INDEX* output,
+    ELEMENT stepSize,
+    INDEX numBins,
+    ELEMENT min,
+    INDEX size
+) {
     INDEX startIdx = blockDim.x * blockIdx.x + threadIdx.x;
     int t = threadIdx.x;
 
-    ELEMENT* input = &copyA[0];
-    ELEMENT* output = &copyA[blockDim.x];
+    extern __shared__ INDEX histRes[];
 
-    
+    if (t < numBins) {
+        histRes[t] = 0; 
+    }
+    __syncthreads();
+
+    if (startIdx < size) {
+        ELEMENT diff = input[startIdx] - min;
+        INDEX curHist;
+        if (stepSize <= 0) {
+            curHist = 0; // Handle invalid stepSize
+        } else if (diff > ELEMENT_MAX - (stepSize - 1)) {
+            curHist = diff / stepSize + (diff % stepSize != 0); // Safe ceiling
+        } else {
+            curHist = (diff + stepSize - 1) / stepSize;
+        }
+        atomicAdd((unsigned long long*)&histRes[curHist], (unsigned long long) 1);
+    }
+
+    __syncthreads();
+    if (t < numBins) {
+        output[blockIdx.x * numBins + t] = histRes[t];
+    }
 
 }
 
@@ -75,14 +105,16 @@ void printUsage(const char* program_name) {
     printf("  --incrementing : Use incrementing input values\n");
     printf("  --size N       : Set input array size (default: 1024)\n");
     printf("  --bins N       : Set number of histogram bins (default: 256)\n");
+    printf("  --verify       : Enable verification of minmax results (default: false)\n");
     printf("\nExample: %s --incrementing --size 2048 --bins 128\n", program_name);
 }
 
-int parseArguments(int argc, char** argv, bool* use_random, INDEX* size, INDEX* num_bins) {
+int parseArguments(int argc, char** argv, bool* use_random, INDEX* size, INDEX* numBins, bool* verify) {
     // Default parameters
     *use_random = true;
     *size = 1024;
-    *num_bins = 256;
+    *numBins = 256;
+    *verify = false;
     
     // Parse command line arguments
     for (int i = 1; i < argc; i++) {
@@ -90,6 +122,8 @@ int parseArguments(int argc, char** argv, bool* use_random, INDEX* size, INDEX* 
             *use_random = false;
         } else if (strcmp(argv[i], "--random") == 0) {
             *use_random = true;
+        } else if (strcmp(argv[i], "--verify") == 0) {
+            *verify = true;
         } else if (strcmp(argv[i], "--size") == 0) {
             if (i + 1 < argc) {
                 *size = atoi(argv[++i]);
@@ -103,8 +137,8 @@ int parseArguments(int argc, char** argv, bool* use_random, INDEX* size, INDEX* 
             }
         } else if (strcmp(argv[i], "--bins") == 0) {
             if (i + 1 < argc) {
-                *num_bins = atoi(argv[++i]);
-                if (*num_bins <= 0) {
+                *numBins = atoi(argv[++i]);
+                if (*numBins <= 0) {
                     printf("Error: Number of bins must be positive\n");
                     return 1;
                 }
@@ -152,7 +186,11 @@ INDEX getMaxElements() {
             p.maxThreadsDim[0] // 1 thread handles 2 elments
         )
     );
-    return powerOf2(numElements); 
+    INDEX powerOf2Element = powerOf2(numElements);
+    if (powerOf2Element > numElements) {
+        powerOf2Element >>= 1; 
+    }
+    return powerOf2Element;
 }
 
 void verifyMinMaxResults(ELEMENT gpuMin, ELEMENT gpuMax, ELEMENT cpuMin, ELEMENT cpuMax) {
@@ -161,22 +199,96 @@ void verifyMinMaxResults(ELEMENT gpuMin, ELEMENT gpuMax, ELEMENT cpuMin, ELEMENT
     printf("CPU Min: %u, Max: %u\n", cpuMin, cpuMax);
     
     if (gpuMin == cpuMin && gpuMax == cpuMax) {
-        printf("Results match! Verification successful.\n");
+        printf(ANSI_COLOR_GREEN "Results match! Verification successful." ANSI_COLOR_RESET "\n");
     } else {
-        printf("ERROR: Results do not match!\n");
+        printf(ANSI_COLOR_RED "ERROR: Results do not match!\n");
         if (gpuMin != cpuMin) printf("Min values differ - GPU: %u, CPU: %u\n", gpuMin, cpuMin);
         if (gpuMax != cpuMax) printf("Max values differ - GPU: %u, CPU: %u\n", gpuMax, cpuMax);
+        printf(ANSI_COLOR_RESET);
     }
+}
+
+void verifyHistResults(
+    INDEX* dLocalHists,
+    ELEMENT* hInput,
+    INDEX numBlocks,
+    INDEX numBins,
+    INDEX size,
+    ELEMENT stepSize,
+    ELEMENT minVal
+) {
+    // Allocate and compute final histogram on CPU
+    INDEX* hLocalHists = (INDEX*)malloc(numBlocks * numBins * sizeof(INDEX));
+    INDEX* hFinalHist = (INDEX*)calloc(numBins, sizeof(INDEX));
+    CU(cudaMemcpy(hLocalHists, dLocalHists, numBlocks * numBins * sizeof(INDEX), cudaMemcpyDeviceToHost));
+
+    // Sum up local histograms from each block
+    for (INDEX block = 0; block < numBlocks; block++) {
+        for (INDEX bin = 0; bin < numBins; bin++) {
+            hFinalHist[bin] += hLocalHists[block * numBins + bin];
+        }
+    }
+
+    // Compute CPU histogram for verification
+    INDEX* hCPUHist = (INDEX*)calloc(numBins, sizeof(INDEX));
+    for (INDEX i = 0; i < size; i++) {
+        ELEMENT diff = hInput[i] - minVal;
+        INDEX binIdx;
+        if (stepSize <= 0) {
+            binIdx = 0;
+        } else if (diff > ELEMENT_MAX - (stepSize - 1)) {
+            binIdx = diff / stepSize + (diff % stepSize != 0);
+        } else {
+            binIdx = (diff + stepSize - 1) / stepSize;
+        }
+
+        if (binIdx < numBins) {
+            hCPUHist[binIdx]++;
+        }
+    }
+
+    // Verify results
+    bool mismatch = false;
+    printf("\nHistogram Verification:\n");
+    for (INDEX i = 0; i < numBins; i++) {
+        if (hFinalHist[i] != hCPUHist[i]) {
+            printf(ANSI_COLOR_RED "Mismatch at bin %ld: GPU = %ld, CPU = %ld\n" ANSI_COLOR_RESET, 
+                   i, hFinalHist[i], hCPUHist[i]);
+            mismatch = true;
+        }
+    }
+    
+    if (!mismatch) {
+        printf(ANSI_COLOR_GREEN "Histogram verification successful! All bins match.\n" ANSI_COLOR_RESET);
+    }
+
+    // Print first few bins of the histogram
+    printf("\nFirst 10 histogram bins:\n");
+    printf("Bin:  ");
+    for (INDEX i = 0; i < min(numBins, (INDEX)10); i++) {
+        printf("%8ld ", i);
+    }
+    printf("\nCount:");
+    for (INDEX i = 0; i < min(numBins, (INDEX)10); i++) {
+        printf("%8ld ", hFinalHist[i]);
+    }
+    printf("\n");
+
+    // Cleanup
+    free(hLocalHists);
+    free(hFinalHist);
+    free(hCPUHist);
 }
 
 int main(int argc, char** argv) {
     // Parameters to be set by parseArguments
     bool use_random;
     INDEX size;
-    INDEX num_bins;
+    INDEX numBins;
+    bool verify;
     
     // Parse command line arguments
-    if (parseArguments(argc, argv, &use_random, &size, &num_bins) != 0) {
+    if (parseArguments(argc, argv, &use_random, &size, &numBins, &verify) != 0) {
         printUsage(argv[0]);
         return 1;
     }
@@ -186,7 +298,8 @@ int main(int argc, char** argv) {
     printf("Running with parameters:\n");
     printf("  Input type: %s\n", use_random ? "random" : "incrementing");
     printf("  Array size: %ld, padded: %ld\n", size, sizePadded);
-    printf("  Number of bins: %ld\n", num_bins);
+    printf("  Number of bins: %ld\n", numBins);
+    printf("  Verification: %s\n", verify ? "enabled" : "disabled");
     
     // Host memory allocation
     ELEMENT* hInput = (ELEMENT*)malloc(sizePadded * sizeof(ELEMENT));
@@ -195,12 +308,12 @@ int main(int argc, char** argv) {
     if (use_random) {
         printf("Using random input values\n");
         for (int i = 0; i < size; i++) {
-            hInput[i] = rand();  // Values between 0 and num_bins-1
+            hInput[i] = rand();  // Values between 0 and numBins-1
         }
     } else {
         printf("Using incrementing input values\n");
         for (int i = 0; i < size; i++) {
-            hInput[i] = i;  // Values cycle from 0 to num_bins-1
+            hInput[i] = i;  // Values cycle from 0 to numBins-1
         }
     }
     // pad with the last elements
@@ -213,14 +326,18 @@ int main(int argc, char** argv) {
     
     INDEX maxElements = min(getMaxElements(), sizePadded);
     INDEX numElements = sizePadded; 
-    int numBlocks = ceil(numElements / maxElements); 
+    INDEX numBlocks = ceil(numElements / maxElements); 
     int numThreads = min(numElements, maxElements); 
 
     // Device memory allocation
     ELEMENT* dInput;
+    ELEMENT* dInputCopy;
     CU(cudaMalloc((void**)&dInput, sizePadded * sizeof(ELEMENT)));
+    CU(cudaMalloc((void**)&dInputCopy, sizePadded * sizeof(ELEMENT)));
     // Copy input data to device
     CU(cudaMemcpy(dInput, hInput, sizePadded * sizeof(ELEMENT), cudaMemcpyHostToDevice));
+    // Make a copy of the input array
+    CU(cudaMemcpy(dInputCopy, dInput, sizePadded * sizeof(ELEMENT), cudaMemcpyDeviceToDevice));
     
 
     ELEMENT* dOutput;
@@ -233,7 +350,7 @@ int main(int argc, char** argv) {
         numBlocks = ceil((float)numElements / maxElements);
         INDEX curNumElements = min(numElements, maxElements);
         numThreads = curNumElements / 2; 
-        printf("  Blocks: %d, Threads: %d\n", numBlocks, numThreads);
+
         // TODO: Need to properly swapped out input and output here per iteration
         minmax<<<numBlocks, numThreads, curNumElements * 2 * sizeof(ELEMENT)>>>(dInput, dOutput, curSize); 
 
@@ -252,18 +369,53 @@ int main(int argc, char** argv) {
         dOutput = temp; 
     }
     
-    // CPU verification
-    ELEMENT cpuMin = ELEMENT_MAX;
-    ELEMENT cpuMax = ELEMENT_MIN;
-    
-    // Simple sequential min/max calculation for verification
-    for (INDEX i = 0; i < size; i++) {
-        cpuMin = min(cpuMin, hInput[i]);
-        cpuMax = max(cpuMax, hInput[i]);
+    if (verify) {
+        // CPU verification
+        ELEMENT cpuMin = ELEMENT_MAX;
+        ELEMENT cpuMax = ELEMENT_MIN;
+        
+        // Simple sequential min/max calculation for verification
+        for (INDEX i = 0; i < size; i++) {
+            cpuMin = min(cpuMin, hInput[i]);
+            cpuMax = max(cpuMax, hInput[i]);
+        }
+        
+        // Compare GPU and CPU results
+        verifyMinMaxResults(hOut[0], hOut[1], cpuMin, cpuMax);
+    } else {
+        printf("\nResults:\n");
+        printf("GPU Min: %u, Max: %u\n", hOut[0], hOut[1]);
     }
-    
-    // Compare GPU and CPU results
-    verifyMinMaxResults(hOut[0], hOut[1], cpuMin, cpuMax);
+    ELEMENT diff = hOut[1] - hOut[0];
+    ELEMENT stepSize;
+    if (diff > ELEMENT_MAX - numBins) {
+        stepSize = diff / numBins + (diff % numBins != 0); // Add 1 if there's a remainder
+    } else {
+        stepSize = (diff + numBins - 1) / numBins;
+    }
+
+    // each thread now handle only a single element
+    maxElements = maxElements / 2; 
+    numBlocks = ceil(sizePadded / (float)maxElements); 
+    numThreads = min(sizePadded, maxElements); 
+
+    INDEX* dLocalHists;
+    CU(cudaMalloc(&dLocalHists, numBlocks * numBins * sizeof(INDEX)));
+
+    hist<<<numBlocks, numThreads, numBins * sizeof(INDEX)>>>(
+        dInputCopy,
+        dLocalHists,
+        stepSize, 
+        numBins, 
+        hOut[0],
+        size
+    );
+
+    if (verify) {
+        CU(cudaDeviceSynchronize());
+        // Verify histogram results
+        verifyHistResults(dLocalHists, hInput, numBlocks, numBins, size, stepSize, hOut[0]);
+    }
 
     // Free host memory
     free(hInput);
@@ -271,7 +423,8 @@ int main(int argc, char** argv) {
     // // Free device memory
     CU(cudaFree(dInput));
     CU(cudaFree(dOutput));
+    CU(cudaFree(dLocalHists));
     
-    printf("Program completed successfully!\n");
+    printf(ANSI_COLOR_GREEN "Program completed successfully!\n" ANSI_COLOR_RESET);
     return 0;
 }
