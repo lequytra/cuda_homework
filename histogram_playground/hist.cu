@@ -522,25 +522,35 @@ int main(int argc, char** argv) {
     INDEX maxElementsAdd = getMaxElementsAdd();
     numElements = powerOf2(numBlocks); 
 
-    INDEX* hHistOutput = (INDEX*)malloc(numBins * sizeof(INDEX));
+    INDEX* hHistOutput = (INDEX*)malloc(numBins * sizeof(INDEX));    
 
     for (INDEX curBin = 0; curBin < numBins; curBin++) {
         INDEX elementsPerBlock = min(maxElementsAdd, numElements);
         INDEX numAddBlocks = ceil(elementsPerBlock / (float)maxElementsAdd);
         curSize = numBlocks; 
+        int curStream = curBin % numStreams;
 
-        INDEX *dAddIn = dLocalHists + curBin * numBlocks;
+        INDEX *dAddIn;
+        CU(cudaMallocAsync(&dAddIn, numBlocks * sizeof(INDEX), streams[curStream]));
+        CU(cudaMemcpyAsync(
+            dAddIn,
+            dLocalHists + curBin * numBlocks,
+            numBlocks * sizeof(INDEX),
+            cudaMemcpyDeviceToDevice,
+            streams[curStream]
+        ));
+
         INDEX *dAddOut; 
-        CU(cudaMalloc(&dAddOut, numAddBlocks * sizeof(INDEX)));
+        CU(cudaMallocAsync(&dAddOut, numAddBlocks * sizeof(INDEX), streams[curStream]));
 
         for (;;) {
-            printf("Bin %ld: blocks=%ld, threads=%ld, elements per block=%ld, current size=%ld\n",
-                   curBin, numAddBlocks, elementsPerBlock >> 2, elementsPerBlock, curSize);
+            // printf("Bin %ld: blocks=%ld, threads=%ld, elements per block=%ld, current size=%ld\n",
+            //        curBin, numAddBlocks, elementsPerBlock >> 2, elementsPerBlock, curSize);
             addKernel<<<
                 numAddBlocks, 
                 elementsPerBlock >> 1, 
                 elementsPerBlock * sizeof(INDEX), 
-                streams[curBin % numStreams]
+                streams[curStream]
             >>>(
                 curSize,
                 dAddIn,
@@ -552,7 +562,8 @@ int main(int argc, char** argv) {
                     hHistOutput + curBin,
                     dAddOut,
                     sizeof(INDEX),
-                    cudaMemcpyDeviceToHost
+                    cudaMemcpyDeviceToHost,
+                    streams[curStream]
                 ));
                 break;
             }
@@ -566,14 +577,13 @@ int main(int argc, char** argv) {
             dAddOut = temp;
         }
     }
-    
+
+    CU(cudaDeviceSynchronize());
     if (verify) {
-        CU(cudaDeviceSynchronize());
         // Verify histogram results
         verifyHistResults(hHistOutput, hInput, numBlocks, numBins, size, stepSize, hOut[0], false);
     }
     
-
     for (INDEX s = 0; s < numStreams; s++) {
         CU(cudaStreamDestroy(streams[s]));
     }
