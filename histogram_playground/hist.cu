@@ -525,9 +525,10 @@ int main(int argc, char** argv) {
     INDEX* hHistOutput = (INDEX*)malloc(numBins * sizeof(INDEX));    
 
     for (INDEX curBin = 0; curBin < numBins; curBin++) {
-        INDEX elementsPerBlock = min(maxElementsAdd, numElements);
-        INDEX numAddBlocks = ceil(elementsPerBlock / (float)maxElementsAdd);
         curSize = numBlocks; 
+        INDEX elementsPerBlock = min(maxElementsAdd, numElements);
+        INDEX numAddBlocks = ceil(curSize / (float)elementsPerBlock);
+        
         int curStream = curBin % numStreams;
 
         INDEX *dAddIn;
@@ -545,7 +546,7 @@ int main(int argc, char** argv) {
 
         for (;;) {
             // printf("Bin %ld: blocks=%ld, threads=%ld, elements per block=%ld, current size=%ld\n",
-            //        curBin, numAddBlocks, elementsPerBlock >> 2, elementsPerBlock, curSize);
+            //        curBin, numAddBlocks, elementsPerBlock >> 1, elementsPerBlock, curSize);
             addKernel<<<
                 numAddBlocks, 
                 elementsPerBlock >> 1, 
