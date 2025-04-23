@@ -32,6 +32,16 @@ const ELEMENT ELEMENT_MIN = 0;
 
 const int MAX_NUM_STREAMS = 4; 
 
+template <typename T, typename IndexType>
+__device__ T get(T* A, IndexType i, IndexType j, IndexType N) {
+    return A[i * N + j];
+}
+
+template <typename T, typename IndexType>
+__device__ void set(T* A, IndexType i, IndexType j, IndexType N, T value) {
+    A[i * N + j] = value;
+}
+
 __global__ void minmax(ELEMENT* input, ELEMENT* output, INDEX size) {
     INDEX startIdx = blockIdx.x * blockDim.x * 2 + threadIdx.x;
     INDEX t = threadIdx.x; 
@@ -95,7 +105,8 @@ __global__ void hist(
 
     __syncthreads();
     if (t < numBins) {
-        output[blockIdx.x * numBins + t] = histRes[t];
+        set<INDEX, INDEX>(output, t, blockIdx.x, gridDim.x, histRes[t]);
+        // output[blockIdx.x * numBins + t] = histRes[t];
     }
 
 }
@@ -279,11 +290,13 @@ void verifyHistResults(
     if (needComputeFinal) {
         hFinalHist = (INDEX*)calloc(numBins, sizeof(INDEX));
         hLocalHists = (INDEX*)malloc(numBlocks * numBins * sizeof(INDEX));
-        CU(cudaMemcpy(hLocalHists, dLocalHists, numBlocks * numBins * sizeof(INDEX), cudaMemcpyDeviceToHost));
+        // [numBins, numBlocks]
+        CU(cudaMemcpy(hLocalHists, dLocalHists, numBins * numBlocks * sizeof(INDEX), cudaMemcpyDeviceToHost));
         // Sum up local histograms from each block
         for (INDEX block = 0; block < numBlocks; block++) {
             for (INDEX bin = 0; bin < numBins; bin++) {
-                hFinalHist[bin] += hLocalHists[block * numBins + bin];
+                hFinalHist[bin] += hLocalHists[bin * numBlocks + block];
+                // hFinalHist[bin] += hLocalHists[block * numBins + bin];
             }
         }
     } 
@@ -483,7 +496,7 @@ int main(int argc, char** argv) {
     numThreads = min(sizePadded, maxElements); 
 
     INDEX* dLocalHists;
-    CU(cudaMalloc(&dLocalHists, numBlocks * numBins * sizeof(INDEX)));
+    CU(cudaMalloc(&dLocalHists, numBins * numBlocks * sizeof(INDEX)));
 
     hist<<<numBlocks, numThreads, numBins * sizeof(INDEX)>>>(
         dInputCopy,
@@ -516,23 +529,16 @@ int main(int argc, char** argv) {
         INDEX numAddBlocks = ceil(elementsPerBlock / (float)maxElementsAdd);
         curSize = numBlocks; 
 
-        // copy the input array to avoid race condition across streams
-        INDEX *dAddIn;
-        CU(cudaMalloc(&dAddIn, curSize * sizeof(INDEX)));
-        CU(cudaMemcpyAsync(
-            dAddIn,
-            dLocalHists + curBin * curSize,
-            curSize * sizeof(INDEX),
-            cudaMemcpyDeviceToDevice
-        ));
+        INDEX *dAddIn = dLocalHists + curBin * numBlocks;
         INDEX *dAddOut; 
         CU(cudaMalloc(&dAddOut, numAddBlocks * sizeof(INDEX)));
+
         for (;;) {
-            printf("Kernel config for bin %ld: blocks=%ld, threads=%ld, shared mem=%ld bytes\n",
-                   curBin, numAddBlocks, elementsPerBlock >> 2, elementsPerBlock * sizeof(INDEX));
+            printf("Bin %ld: blocks=%ld, threads=%ld, elements per block=%ld, current size=%ld\n",
+                   curBin, numAddBlocks, elementsPerBlock >> 2, elementsPerBlock, curSize);
             addKernel<<<
                 numAddBlocks, 
-                elementsPerBlock >> 2, 
+                elementsPerBlock >> 1, 
                 elementsPerBlock * sizeof(INDEX), 
                 streams[curBin % numStreams]
             >>>(
@@ -542,9 +548,6 @@ int main(int argc, char** argv) {
             );
 
             if (numAddBlocks <= 1) {
-                // TODO: how does this work when mutliple bins share the same stream?
-                // Will this also prevent getting to the next bin due to CPU blocking?
-                CU(cudaStreamSynchronize(streams[curBin % numStreams]));
                 CU(cudaMemcpyAsync(
                     hHistOutput + curBin,
                     dAddOut,
