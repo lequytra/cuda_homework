@@ -1,1 +1,9 @@
-*log.*
+*log*
+*.png
+*.jpg
+*.JPG
+*.jpeg
+*.bmp
+*.gif
+*.tiff
+*.webp
